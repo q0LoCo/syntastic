@@ -91,7 +91,8 @@ function! g:SyntasticLoclist.getStatuslineFlag() " {{{2
     if g:syntastic_stl_format !=# self._stl_format
         let self._stl_format = g:syntastic_stl_format
 
-        if !empty(self._rawLoclist)
+        if !empty(self._rawLoclist) || ( g:syntastic_enable_async &&
+                    \ GetTotalErrorNumInAsyncMode() != 0 )
             let errors = self.errors()
             let warnings = self.warnings()
 
@@ -109,6 +110,18 @@ function! g:SyntasticLoclist.getStatuslineFlag() " {{{2
 
             "hide stuff wrapped in %B(...) unless there are both errors and warnings
             let output = substitute(output, '\m\C%B{\([^}]*\)}', (num_warnings && num_errors) ? '\1' : '' , 'g')
+
+            if g:syntastic_enable_async
+                let total_issues_across_bufs = GetTotalErrorNumInAsyncMode()
+                "hide stuff wrapped in %EI(...) unless there are either errors or warnings
+                let output = substitute(output, '\m\C%EI{\([^}]*\)}', (num_warnings || num_errors) ? '\1' : '', 'g')
+
+                "hide stuff wrapped in %T(...) unless there are errors and warnings
+                let output = substitute(output, '\m\C%T{\([^}]*\)}', (total_issues_across_bufs) ? '\1' : '', 'g')
+
+                "total sum of all bufs' errors and warnings
+                let output = substitute(output, '\m\C%Tn', total_issues_across_bufs, 'g')
+            endif
 
             "sub in the total errors/warnings/both
             let output = substitute(output, '\m\C%w', num_warnings, 'g')

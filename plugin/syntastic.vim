@@ -277,6 +277,893 @@ endfunction " }}}2
 
 " Main {{{1
 
+
+" ----------------------------
+"  below is client code {{{1
+if !exists("g:syntastic_enable_async")
+    let g:syntastic_enable_async = 0
+endif
+
+if !exists("g:syntastic_async_delay_error_refresh")
+    let g:syntastic_async_delay_error_refresh = 0
+endif
+
+if !exists("g:syntastic_async_delay_refresh_time")
+    let g:syntastic_async_delay_refresh_time = 2000
+endif
+
+if !exists("g:syntastic_async_servername")
+    let g:syntastic_async_servername = "SYNTASTIC"
+    "NOTE: this variable is used in s:StartupServer, if vim cannot register
+    " itself with this name, vim will append 1, 2, 3 etc to the end of name.
+    " it's different than servername, async_servername can be SYNTASTIC1 but
+    " this one can't, otherwise you will see SYNTASTIC111111 if vim server
+    " startup failed multi times.
+    let g:syntastic_async_startup_servername = g:syntastic_async_servername
+endif
+
+" a round of time you can wait for server startup complete, default is 30, means 3000ms.
+if !exists("g:syntastic_async_wait_server_startup_time")
+    let g:syntastic_async_wait_server_startup_time = 30
+endif
+
+if !exists("g:syntastic_async_tmux_if_possible")
+    let g:syntastic_async_tmux_if_possible = 1
+endif
+
+if !exists("g:syntastic_async_tmux_new_window")
+    let g:syntastic_async_tmux_new_window = 1
+endif
+
+function! s:HasServer()
+    let server_list = split(serverlist(), "\n")
+    return count(server_list, g:syntastic_async_servername)
+endfunction
+
+function! s:TellServerExit()
+    if s:HasServer()
+        let name = '"'.escape(v:servername, '"\').'"'
+        call remote_send(g:syntastic_async_servername, "<ESC>:call TryCloseServer(".name.")<CR>")
+        "call remote_send(g:syntastic_async_servername, "<ESC>:qa!<CR>")
+    endif
+endfunction
+
+let s:is_client_ready = 0
+function! s:SetupClient()
+    " if bufname match and directly update errors interface,
+    " cursor will move to other places. So update using CursorHold
+    " and CursorHoldI solve the problem.
+    if g:syntastic_async_delay_error_refresh
+        "set updatetime=2000
+        let &updatetime = g:syntastic_async_delay_refresh_time
+    endif
+
+    augroup syntastic_async_client
+        autocmd!
+        autocmd RemoteReply * call s:RemoteReplyMsgDispatcher(remote_read(expand("<amatch>")))
+        autocmd VimLeavePre * call s:TellServerExit()
+        autocmd BufEnter * call s:NotifyErrors()
+        autocmd BufDelete * call s:UpdateBufErrorsNumMap(expand("<afile>"), 0)
+        if g:syntastic_async_delay_error_refresh
+            autocmd CursorHold,CursorHoldI * call s:NotifyErrors()
+        endif
+    augroup END
+
+    let s:is_client_ready = 1
+endfunction
+
+" start the vim syntastic server if it's not started
+let s:syntastic_server_rc='"'.expand("<sfile>:p:h").'/async.vim"'
+function! s:StartupServerOnly()
+    if !has('clientserver')
+        let g:syntastic_enable_async = 0
+        return
+    endif
+
+    if !s:HasServer()
+        let server_rc = s:syntastic_server_rc
+        call syntastic#log#debug(g:_SYNTASTIC_DEBUG_TRACE, "StartupServer: server rc: " . server_rc)
+
+        let server = ""
+        if executable("vim")
+            let server = "vim"
+        elseif executable("gvim")
+            let server = "gvim"
+        else
+            let g:syntastic_enable_async = 0
+            echom "strange: gvim and vim don't exist on path"
+            return
+        endif
+
+        let server_cmd = server." -M -u ".server_rc." --noplugin "
+                    \ ."--servername ".g:syntastic_async_startup_servername
+        " :! use '(cmd &)' and system() use 'cmd &'. system() has redirect
+        " pipe by default but :! can do redirect manually. :! without redirection
+        " may flicker vim terminal when there are something output.
+        if has('unix')
+            if server ==# "vim"
+                if !empty($TMUX) && !exists('$SUDO_UID') && executable('tmux')
+                            \ && g:syntastic_async_tmux_if_possible
+                    let cmd = 'tmux split-window -l 6 -d'
+                    if g:syntastic_async_tmux_new_window
+                        " default window number is 9
+                        let cmd = 'tmux new-window -d -n "syntastic_daemon" -t 9'
+                    endif
+                    let cmd .= ' "'.escape(server_cmd, '"').'"'
+                else
+                    " gnome-terminal can set WM_WINDOW_ROLE, so xwit can minimize.
+                    let cmd = "gnome-terminal --class \"VIMSERVER\" --disable-factory"
+                                \ .' --role "syntastic_server"'
+                                \ .' -e "'.escape(server_cmd, '"').'" &'
+                endif
+            else
+                " gvim can set WM_WINDOW_ROLE, xwit can minimized it with
+                " xwit -iconify -property WM_WINDOW_ROLE -names "syntastic_server"
+                let cmd = server_cmd.' --role "syntastic_server" &'
+            endif
+        else
+            let cmd = "start /B ".server_cmd." && exit"
+        endif
+        call syntastic#log#debug(g:_SYNTASTIC_DEBUG_TRACE, "StartupServer: start server cmd: " . cmd)
+
+        if !has('gui_running')
+            " silent :! will cause some display problem, maybe a blank terminal
+            " etc. ctrl+l or redraw! fix this problem.
+            augroup fix_vim_silent_exe_redraw
+                au!
+                autocmd CursorMoved,CursorMovedI *  call syntastic#util#redraw(g:syntastic_full_redraws) |
+                            \ exec "au! fix_vim_silent_exe_redraw" |
+                            \ aug! fix_vim_silent_exe_redraw
+            augroup END
+        endif
+        "call system("start /B gvim -u ".server_rc.cmd." --servername syntastic && exit")
+        "silent exec ":!".cmd | call s:Redraw()
+        if s:_running_windows
+            silent exec ":!".cmd
+        else
+            call system(cmd)
+        endif
+    endif
+endfunction
+
+fun! s:WaitAFewForServerStart()
+    if !s:HasServer()
+        let loopcount = g:syntastic_async_wait_server_startup_time
+        let halfcount = loopcount / 2
+        let warned = 0
+        " server register get a delay on unix, we can't start following
+        " checker right now, otherwise multi vim or gvim server will
+        " startup, client will confuse.
+        " TODO: currently we use while and sleep wait for the server
+        " startup complete. maybe there is a better way to do this.
+        while !s:HasServer() && loopcount >= 0
+            let server_str = string(serverlist())
+            if server_str =~? 'syntastic\d\+'
+                if !warned
+                    let t_warning = "multi server instances found, VimRegistry property ".
+                                \ "already set on the root window on X-server."
+                    call syntastic#log#warn(t_warning)
+                    let warned = 1
+                endif
+                if (halfcount < 10 && loopcount == 0) || (loopcount == halfcount && halfcount > 10)
+                    let g:syntastic_async_servername = matchstr(server_str,
+                                \ 'SYNTASTIC\d\+')
+                    let t_warning_2 = "server cannot set the name to SYNTASTIC, "
+                                \ ."previous instance doesn't quit correctly. you need "
+                                \ ."to logout to fix this."
+                    let t_warning_3 = "change servername to ".g:syntastic_async_servername
+                    call syntastic#log#warn(t_warning_2)
+                    call syntastic#log#warn(t_warning_3)
+                    break
+                endif
+            endif
+            if loopcount == halfcount
+                call syntastic#log#warn('server startup slow, wait a bit longer')
+            endif
+            let loopcount -= 1
+            sleep 100m
+        endwhile
+    endif
+endf
+
+let s:total_startup_server_failures = 0
+function! s:RemoteSyntasticCheck(msg_header, rpc_options)
+    let message = a:msg_header.'@@@@'.string(a:rpc_options)
+    " we use doublequote to warp the message, so backslash
+    " should be escaped first.
+    let message = escape(message, '"\')
+    let message = '"'.message.'"'
+
+    if !s:is_client_ready
+        call s:SetupClient()
+    endif
+
+    if !s:HasServer()
+        call s:StartupServerOnly()
+        call s:WaitAFewForServerStart()
+        if !s:HasServer()
+            let s:total_startup_server_failures += 1
+            let msg_error = "server fail to startup in time, abandon check this time,".
+                        \ " try again later"
+            call syntastic#log#error(msg_error)
+
+            if s:total_startup_server_failures == 5
+                let g:syntastic_enable_async = 0
+                call syntastic#log#error("fail to startup server 5 times, disalbe async.")
+            endif
+
+            return
+        endif
+    endif
+
+    try
+        call remote_send(g:syntastic_async_servername, "<ESC>:call SyntasticServerDispatchHandler("
+                    \ .message.")<CR>")
+        " reset failure count if successful sending msg
+        let s:total_startup_server_failures = 0
+    catch /^Vim\%((\a\+)\)\=:E241/	" catch error E123
+        call syntastic#log#error("Can't send message to server")
+    endtry
+endfunction
+
+function! s:IsAsyncMake(signal)
+    if type(a:signal) != type([]) || len(a:signal) != 1
+        return 0
+    endif
+    let item = a:signal[0]
+    return has_key(item, 'async') && item['async'] ==# 'async'
+endfunction
+
+function! s:PrepareCheckers(checker_list, aggregate_errors)
+    " exit code check can be done on server, send them too.
+    let checker_filetype_options_list = []
+
+    if a:aggregate_errors
+        let special_checker_number = 0
+        let total_checker_number = 0
+    else
+        let special_checker_at_the_front = 0
+    endif
+
+    for checker in a:checker_list
+        if !checker.isAvailable()
+            " new syntastic has to explicitly check whether a checker is active
+            continue
+        endif
+
+        " need to figure out whether special checkers exist, tell server.
+        " special checker, for example ycm, cannot be run on server.
+
+        let checker_name = checker.getName()
+        let ft = checker.getFiletype()
+        " this func will call modified SyntasticMake() then return back
+        " checker's option, including makeprg, efm and other things.
+        try
+            let signal = checker.getLocListRaw()
+        catch /^Vim\%((\a\+)\)\=:E/	" catch all Vim errors
+            let err_msg = 'PrepareCheckers: '.checker_name.' throw an error: "'.v:exception.'" when extract checkers options. skip this checker.'
+            call syntastic#log#error(err_msg)
+            continue
+        endtry
+
+        let isAsyncMake = s:IsAsyncMake(signal)
+
+        if !exists("b:syntastic_make_options")
+            if isAsyncMake
+                " isAsyncMake means SyntasticMake() is called, if
+                " async is enabled and SyntasticMake() is called, there
+                " must be a b:syntastic_make_options variable.
+                echohl Error | echomsg "AsyncCacheErrors can't find make options" | echohl None
+                continue
+            endif
+
+            " special checker here
+            " only allow a checker which has non empty result get added
+            if type(signal) == type([]) && !empty(signal)
+                let sp_options = {'makeprg': 'sp', 'special_checker': 1, 'raw_errors': signal}
+                if a:aggregate_errors
+                    let special_checker_number += 1
+                else
+                    if empty(checker_filetype_options_list)
+                        " this special checker is at the front of list
+                        let special_checker_at_the_front = 1
+                    endif
+                endif
+                call add(checker_filetype_options_list, [checker_name, ft, sp_options])
+                if !a:aggregate_errors
+                    " since new syntastic put all checkers into one list
+                    " without considering their filetype. old beheaviour will
+                    " roll other filetype but this time, no mater how many
+                    " checkers' behide we know it will stop on this special
+                    " checker index if previous checkers return nothing in non
+                    " aggregate mode. it's new end index.
+                    break
+                endif
+            endif
+            continue
+        endif
+
+        if !isAsyncMake
+            " most of checker directly return SyntasticMake()'s result,
+            " but rare checkers will do somethings with that result.
+            echohl Error | echomsg checker.getName()." modify async ".
+                        \ "checker_options signal, most of time, ".
+                        \ "this should not happen" | echohl None
+            " TODO: may be we should terminal this checker?
+        endif
+
+        let checker_options = b:syntastic_make_options
+        unlet b:syntastic_make_options
+
+        let makeprg = get(checker_options, "makeprg", &l:makeprg)
+        if empty(makeprg)
+            let err_msg = checker_name.' has empty makeprg, strange!!!'
+            echohl Error | echomsg err_msg | echohl None
+            continue
+        endif
+        let checker_options['makeprg'] = makeprg
+
+        let checker_options['errorformat'] = get(checker_options, "errorformat", &l:errorformat)
+
+        " new syntastic use util#var
+        let checker_quiet_messages = copy(syntastic#util#var(ft.'_'.checker_name . '_quiet_messages', {}))
+        if type(checker_quiet_messages) == type({}) && !empty(checker_quiet_messages)
+            let checker_options['quiet_messages'] = checker_quiet_messages
+        endif
+
+        call add(checker_filetype_options_list, [checker_name, ft, checker_options])
+    endfor
+
+    if empty(checker_filetype_options_list)
+        " according to sync version, once syntastic check cmd is run,
+        " even if there are no checkers, a emtpy result will always get
+        " updated.
+        " so we may simply update a empty result directly here.
+        call s:UpdateEmptyLocListNow()
+        return
+    endif
+
+    if a:aggregate_errors
+        let total_checker_number = len(checker_filetype_options_list)
+    endif
+
+    if a:aggregate_errors && total_checker_number == special_checker_number
+        " only special checkers in this round, directly update.
+        call s:UpdateSpecialLocListNow(checker_filetype_options_list, a:aggregate_errors)
+        return
+    endif
+
+    if !a:aggregate_errors && special_checker_at_the_front
+        " the special checker at the front of checker list in every filetype,
+        " directly update in this case.
+        call s:UpdateSpecialLocListNow(checker_filetype_options_list, a:aggregate_errors)
+        return
+    endif
+
+    let rpc_options = {}
+    let rpc_options['long_fname'] = expand("%:p")
+    let rpc_options['cwd'] = getcwd()
+    let rpc_options['checker_filetype_options_list'] = checker_filetype_options_list
+    if !empty(v:servername)
+        " if v:servername is available, server can use remote_expr to fix
+        " inconsistent bufnr in raw errors, then directly pass raw errors back
+        " instead of system() output string.
+        let rpc_options['client_name'] = v:servername
+    endif
+    let quiet_filters = copy(syntastic#util#var('quiet_messages', {}))
+    if type(quiet_filters) == type({}) && !empty(quiet_filters)
+        " global g:syntastic_quiet_messages, new syntastic do quite_messages
+        " with checkers' together.
+        let rpc_options['global_quiet_messages'] = quiet_filters
+    endif
+    let exit_checks = syntastic#util#var('exit_checks')
+    let rpc_options['exit_checks'] = exit_checks
+
+    let msg_header = a:aggregate_errors ? 'syntastic_aggregate' : 'syntastic'
+
+    call s:RemoteSyntasticCheck(msg_header, rpc_options)
+endfunction
+
+function! s:UpdateSpecialLocListNow(checker_filetype_options_list, aggregate_errors)
+    let info_map = {}
+    let info_map['short_fname'] = bufname("%")
+    let special_checker_map = {}
+    let checker_ft_raw_errors_list = []
+    for [checker_name, ft, sp_options] in a:checker_filetype_options_list
+        call add(checker_ft_raw_errors_list, [checker_name, ft, sp_options['raw_errors']])
+        let special_checker_map[checker_name] = 1
+        if !a:aggregate_errors
+            " non aggregate mode, we only need the makeprg at the front of each
+            " list.
+            break
+        endif
+    endfor
+
+    let info_map['checker_ft_raw_errors_list'] = checker_ft_raw_errors_list
+    let info_map['special_checkers'] = special_checker_map
+    let newLoclist = s:Private_AsyncErrorPostProcess(info_map, a:aggregate_errors)
+    call s:UpdateLocListInterfaceNow(newLoclist)
+endfunction
+
+function! s:UpdateEmptyLocListNow()
+    call s:UpdateBufErrorsNumMap(bufname("%"), 0)
+    call s:UpdateLocListInterfaceNow({})
+endfunction
+
+function! s:UpdateLocListInterfaceNow(loclist)
+    let newLoclist = a:loclist
+    if empty(a:loclist)
+        let newLoclist = g:SyntasticLoclist.New([])
+    endif
+    let b:syntastic_async_loclist_already_refresh = 0
+    if !g:syntastic_async_delay_error_refresh
+        " TODO: s:RefreshErrors right now cause cursor move to other places like
+        " sign column then wait a few second to restore and it can't be sovled
+        " by setpos(). getpos() report the same value, it looks like a redraw
+        " problem but calling s:Redraw() doesn't work.
+        call s:RefreshErrors(newLoclist)
+        " simulate Left and Right keypress, cursor can be restored faster.
+        call feedkeys("\<Left>\<Right>")
+        return
+    endif
+    " new syntastic use deploy()
+    " let b:syntastic_loclist = newLoclist
+    call newLoclist.deploy()
+endfunction
+
+let s:syntastic_buf_errors_num_map = {}
+let s:syntastic_total_errors_num = 0
+function! s:UpdateBufErrorsNumMap(fname, new_num)
+    if empty(a:fname)
+        return
+    endif
+    if has_key(s:syntastic_buf_errors_num_map, a:fname)
+        let old_num = s:syntastic_buf_errors_num_map[a:fname]
+        let s:syntastic_total_errors_num -= old_num
+    endif
+    let s:syntastic_total_errors_num += a:new_num
+    let s:syntastic_buf_errors_num_map[a:fname] = a:new_num
+endfunction
+" since SyntasticStatuslineFlag func move to loclist.vim, there must be a func to get
+" the private number.
+function! GetTotalErrorNumInAsyncMode()
+    return s:syntastic_total_errors_num
+endfunction
+
+" BufErrorList() show the buffer errors map list in preview window
+function! s:BufErrorNumberList()
+    let preview_name = "SyntasticErrorsPreviewList"
+    "silent! exec "noautocmd botright pedit ".preview_name
+    " botright put preview windows on bottom
+    silent! exec "noautocmd pedit ".preview_name
+    noautocmd wincmd p
+
+    if &previewwindow               " check if we really got there
+        set buftype=nofile
+        " after preview window closed, delete preview buffer
+        set bufhidden=delete
+        call setline(1, "Bufnr    Buffer                    Errors")
+        for [key, value] in items(s:syntastic_buf_errors_num_map)
+            if value != 0
+                " it's strange line("$") return 0 if i open preview window
+                " on top.
+                " b (0) b(10) e(35)
+                let buf_line = bufnr(key)
+                let buf_line = s:SpacesAlignHelper(buf_line, 9, key)
+                let buf_line = s:SpacesAlignHelper(buf_line, 35, value)
+                call append(line("w$"), buf_line)
+            endif
+        endfor
+        set readonly
+        noautocmd wincmd p			" back to old window
+    endif
+endfunction
+
+" this function caculate the spaces needed between col and str end, if col is
+" smaller than str len, it use 4 spaces. Append spaces then the str you want
+" to append.
+function! s:SpacesAlignHelper(str, col, append)
+    let margin = a:col - strdisplaywidth(a:str)
+    let spaces = repeat(' ', margin < 1 ? 4 : margin)
+    return a:str.spaces.a:append
+endfunction
+
+if g:syntastic_enable_async
+    command! BufErrNumList call s:BufErrorNumberList()
+    " override reset command, update s:syntastic_buf_errors_num_map variable
+    command! SyntasticReset call s:ClearCache() |
+                \ call s:notifiers.refresh(g:SyntasticLoclist.New([])) |
+                \ call s:UpdateBufErrorsNumMap(bufname("%"), 0)
+endif
+
+" current buf may not be the same one error checked, so we need to
+" refresh that buf when we swtich to it.
+"autocmd BufWinEnter * call s:NotifyErrors()
+function! s:NotifyErrors()
+    if exists("b:syntastic_async_post_process") &&
+                \ exists("b:syntastic_async_aggregate_errors_flag")
+        let info_map = b:syntastic_async_post_process
+        let aggregate_errors = b:syntastic_async_aggregate_errors_flag
+        unlet b:syntastic_async_post_process
+        unlet b:syntastic_async_aggregate_errors_flag
+        let newLoclist = s:Private_AsyncErrorPostProcess(info_map, aggregate_errors)
+        " let b:syntastic_loclist = newLoclist
+        call newLoclist.deploy()
+    endif
+
+    " don't call s:notifiers.refresh() on the same loclist multi time
+    " otherwise %w parameters on statusline may not work correctly
+    "
+    " b:syntastic_loclist always be set if this buf call syntastic check
+    " even bufname() not match, it's set by calling setbufvar()
+    if empty(&bt) && exists("b:syntastic_async_loclist_already_refresh") &&
+                \ !b:syntastic_async_loclist_already_refresh
+
+        let loclist = g:SyntasticLoclist.current()
+
+        call s:RefreshErrors(loclist)
+    endif
+endfunction
+
+" NOTE: %w with sign enable have problem.
+" SyntasticSignsNotifier._signErrors extend
+" loclist._cachedWarnings without deepcopy().
+" so warnings number on statusline always be the sum of warnings and errors.
+
+" s:RefreshErrors() refresh current buf's errors
+" It mainly copy the later half part of s:UpdateErrors(auto_invoked, ...).
+function! s:RefreshErrors(loclist)
+    " NOTE: s:ClearCache() will unlet b:syntastic_loclist so you must
+    " set this variable before calling notifiers.refresh()
+    "
+    " only call this func on the buf who got errors refresh.
+    "
+    " previous i call this func too early even if bufname() not match
+    " in AsyncUpdateErrors so currently lost sign, hightlight,
+    " statusline so on.
+    call s:ClearCache()
+
+    " let b:syntastic_loclist = a:loclist
+    call a:loclist.deploy()
+
+    let loclist = g:SyntasticLoclist.current()
+
+    " populate loclist and jump {{{3
+    let do_jump = syntastic#util#var('auto_jump')
+    if do_jump == 2
+        let first = loclist.getFirstIssue()
+        let type = get(first, 'type', '')
+        let do_jump = type ==? 'E'
+    endif
+
+    let w:syntastic_loclist_set = 0
+    if syntastic#util#var('always_populate_loc_list') || do_jump
+        call syntastic#log#debug(g:_SYNTASTIC_DEBUG_NOTIFICATIONS, 'loclist: setloclist (new)')
+        call setloclist(0, loclist.getRaw())
+        let w:syntastic_loclist_set = 1
+        if do_jump && !loclist.isEmpty()
+            call syntastic#log#debug(g:_SYNTASTIC_DEBUG_NOTIFICATIONS, 'loclist: jump')
+            silent! lrewind
+
+            " XXX: Vim doesn't call autocmd commands in a predictible
+            " order, which can lead to missing filetype when jumping
+            " to a new file; the following is a workaround for the
+            " resulting brain damage
+            if &filetype == ''
+                silent! filetype detect
+            endif
+        endif
+    endif
+
+    call s:notifiers.refresh(loclist)
+    let b:syntastic_async_loclist_already_refresh = 1
+endfunction
+
+" this function set relate buf variable before refresh gui
+fun! s:Private_PrepareAsyncPostProcess(info_map, aggregate_errors)
+    let short_fname = a:info_map['short_fname']
+
+    if bufname("%") !=# short_fname
+        call setbufvar(short_fname, "syntastic_async_aggregate_errors_flag", a:aggregate_errors)
+        call setbufvar(short_fname, "syntastic_async_post_process", a:info_map)
+        call setbufvar(short_fname, "syntastic_async_loclist_already_refresh", 0)
+        return
+    endif
+
+    let newLoclist = s:Private_AsyncErrorPostProcess(a:info_map, a:aggregate_errors)
+
+    call s:UpdateLocListInterfaceNow(newLoclist)
+endfunction
+
+function! s:RemoteReplyMsgDispatcher(message)
+    if empty(matchstr(a:message, 'syntastic'))
+        return
+    endif
+
+    if match(a:message, '^syntastic@@@@') != -1
+        call s:AsyncUpdateErrors(a:message)
+    elseif match(a:message, '^syntastic_aggregate@@@@') != -1
+        call s:AsyncUpdateAggregateErrors(a:message)
+    elseif match(a:message, '^syntastic_warning_message@@@@') != -1
+        let warning_str = split(a:message, '@@@@')[1]
+        call syntastic#log#warn(warning_str)
+    endif
+endfunction
+
+function! s:EchoExitMessage(msg_list)
+    for [checker_name, filetype, exit_code] in a:msg_list
+        call syntastic#log#error('checker ' . filetype . '/' . checker_name . ' returned abnormal status ' . exit_code)
+    endfor
+endfunction
+
+function! s:EchoWarnMessage(msg_list)
+    for msg in a:msg_list
+        call syntastic#log#warn(msg)
+    endfor
+endfunction
+
+" FixRawErrors try to fix wrong bufnr in raw errors which is right on server
+" but wrong on client. it's used when client's v:servername is not found.
+"
+" TODO: will vim reasign a used bufnr to another files? for example, when max
+" bufnr is reach? then vim collect bufnr started from 1.
+function! s:FixRawErrors(raw_errors, bufnr_long_fname_map, wrong_right_bufnr_map)
+    " try to use bufnr_long_fname_map to fix wrong bufnr in raw_errors
+    let wrong_right_bufnr_map = copy(a:wrong_right_bufnr_map)
+    let fixed_raw_errors = copy(a:raw_errors)
+    for error in fixed_raw_errors
+        let bufnr = error['bufnr']
+        let valid = error['valid']
+
+        if !valid
+            continue
+        endif
+
+        if !has_key(wrong_right_bufnr_map, bufnr)
+            if !has_key(a:bufnr_long_fname_map, bufnr)
+                let err_msg = 'PreprocessServerMsg: a bufnr point to '.
+                            \ 'non register filename, this cannot be happen.'
+                call syntastic#log#error(err_msg)
+                " this make error entry still valid and exists to the end
+                let error['bufnr'] = 0
+                continue
+            endif
+
+            let full_path_name = a:bufnr_long_fname_map[bufnr]
+            let right_bufnr = bufnr(expand(full_path_name), 1)
+            let wrong_right_bufnr_map[bufnr] = right_bufnr
+
+            let error['bufnr'] = right_bufnr
+            continue
+        endif
+
+        let error['bufnr'] = wrong_right_bufnr_map[bufnr]
+    endfor
+
+    return [fixed_raw_errors, wrong_right_bufnr_map]
+endfunction
+
+" call s:AsyncUpdateErrors() after RemoteReply event get syntastic result
+function! s:AsyncUpdateErrors(message)
+    call s:PreprocessServerMsg(a:message, 0)
+endfunction
+
+function! s:AsyncUpdateAggregateErrors(message)
+    call s:PreprocessServerMsg(a:message, 1)
+endfunction
+
+function! s:PreprocessServerMsg(message, aggregate_errors)
+    let options = s:SandboxEvalStr(s:SecureCheckOnMapStr(split(a:message, "@@@@")[1]))
+
+    let long_fname = options['long_fname']
+    " filetype use in checker postprocess, without filetype, you can't use
+    " s:registry.getChecker() to obtain checker.
+    let checker_ft_output_list = options['checker_ft_output_list']
+    let exit_message_list = options['exit_message_list']
+    let warn_msg_list = options['warn_msg_list']
+    let short_fname = expand("#".bufnr(long_fname).":t")
+    let sp_checker_map = options['sp_checker_map']
+    let remain_ft_checkers_map = get(options, 'remain_ft_checkers_map', {})
+    let remote_expr = get(options, 'remote_expr', 0)
+    let bufnr_long_fname_map = get(options, 'bufnr_long_fname_map', {})
+
+    if !empty(exit_message_list)
+        call s:EchoExitMessage(exit_message_list)
+    endif
+
+    if !empty(warn_msg_list)
+        call s:EchoWarnMessage(warn_msg_list)
+    endif
+
+    " abondan empty result early if there is not need to update
+    if len(checker_ft_output_list) == 0 && has_key(s:syntastic_buf_errors_num_map, short_fname) &&
+                \ s:syntastic_buf_errors_num_map[short_fname] == 0
+        " empty result in previous round, empty result in this round too.
+        " no need to refresh gui.
+        return
+    endif
+
+    let result = {}
+    let result['long_fname'] = long_fname
+    let result['short_fname'] = short_fname
+    let checker_ft_raw_errors_list = []
+    let result['checker_ft_raw_errors_list'] = checker_ft_raw_errors_list
+    " special checker raw_errors can be use directly, no postprocess.
+    let result['special_checkers'] = copy(sp_checker_map)
+    let result['remain_ft_checkers_map'] = remain_ft_checkers_map
+    let error_num = 0
+
+    " bufnr and fname map is same within a round of checking
+    let wrong_right_bufnr_map = {}
+    " server use remote_expr to fix wrong bufnr then pass raw_errors
+    " direct.
+    for [checker_name, filetype, raw_errors] in checker_ft_output_list
+        " special checkers' result don't need to fix
+        if !remote_expr && !has_key(sp_checker_map, checker_name)
+            let [raw_errors, wrong_right_bufnr_map] = s:FixRawErrors(raw_errors, bufnr_long_fname_map, wrong_right_bufnr_map)
+        endif
+
+        call add(checker_ft_raw_errors_list, [checker_name, filetype, raw_errors])
+        let error_num += len(raw_errors)
+    endfor
+
+    if error_num == 0 && has_key(s:syntastic_buf_errors_num_map, short_fname) &&
+                \ s:syntastic_buf_errors_num_map[short_fname] == 0
+        " empty result in previous round, empty valid result in this round too.
+        " no need to refresh gui.
+        return
+    endif
+
+    let result['checker_ft_raw_errors_list'] = checker_ft_raw_errors_list
+    call s:UpdateBufErrorsNumMap(short_fname, error_num)
+    call s:Private_PrepareAsyncPostProcess(result, a:aggregate_errors)
+endfunction
+
+function s:SecureCheckOnListStr(str)
+    if !empty(a:str) && a:str[0] ==# '[' && a:str[len(a:str)-1] ==# ']'
+        return a:str
+    endif
+    throw a:str." not a List string"
+endfunction
+
+function s:SecureCheckOnMapStr(str)
+    if !empty(a:str) && a:str[0] ==# '{' && a:str[len(a:str)-1] ==# '}'
+        return a:str
+    endif
+    throw a:str." not a Dictionary string"
+endfunction
+
+" eval() is danger, eval str inside a sandbox
+function s:SandboxEvalStr(str)
+    " dict_str will get wrapped by doublequote, so '\' and '"' must be escaped first
+    let dict_str = escape(a:str, '\"')
+    sandbox exec "let dict = eval(\"".dict_str."\")"
+    return dict
+endfunction
+
+" this function return a checker list which after checker_name in the active
+" checkers list. if no checker found, return a mepty list.
+function! s:GetFollowingCheckers(remain_ft_checkers_map)
+    let clist = []
+    for [ft, checker_names] in items(a:remain_ft_checkers_map)
+        call extend(clist, s:registry.getCheckers(ft, checker_names))
+    endfor
+    return clist
+endfunction
+
+function! s:DecorateAndSort(loclist, checker, cnames, if_decorate, if_sort)
+    let cname = a:checker.getFiletype() . '/' . a:checker.getName()
+    if a:if_decorate
+        call a:loclist.decorate(cname)
+    endif
+    call add(a:cnames, cname)
+    if a:checker.wantSort() && !a:if_sort
+        call a:loclist.sort()
+    endif
+
+    return a:loclist
+endfunction
+
+" SyntasticMake and some plugins have a post process with error returned by
+" makeprg.
+"
+" NOTE: this function should only be call on the buf match the id.
+function! s:Private_AsyncErrorPostProcess(info_map, aggregate_errors)
+    let checker_ft_raw_errors_list = a:info_map['checker_ft_raw_errors_list']
+    let special_checker_map = a:info_map['special_checkers']
+    let short_fname = a:info_map['short_fname']
+    let remain_ft_checkers_map = a:info_map['remain_ft_checkers_map']
+    let names = []
+    if !a:aggregate_errors
+        let following_checkers_list = []
+    endif
+
+    " new master version id feature, directly copy from CacheErrors() body
+    " with slight modification.
+    let decorate_errors = a:aggregate_errors && syntastic#util#var('id_checkers')
+    let sort_aggregated_errors = a:aggregate_errors && syntastic#util#var('sort_aggregated_errors')
+
+    let newLoclist = g:SyntasticLoclist.New([])
+    for [checker_name, filetype, raw_errors] in checker_ft_raw_errors_list
+
+        if has_key(special_checker_map, checker_name)
+            " special checker has no postprocess, raw errors can be used
+            " directly.
+            let sp_list = g:SyntasticLoclist.New(raw_errors)
+            let sp_checker = s:registry.getCheckers(filetype, [checker_name])[0]
+
+            " special checker result here is already get gurantee to be non-empty.
+            let newLoclist = newLoclist.extend(s:DecorateAndSort(sp_list,
+                        \ sp_checker, names, decorate_errors, sort_aggregated_errors))
+            continue
+        endif
+
+        let checker = s:registry.getCheckers(filetype, [checker_name])[0]
+
+        let b:syntastic_async_raw_errors = raw_errors
+        try
+            let post_errors = checker.getLocList()
+        catch /^Vim\%((\a\+)\)\=:E/	" catch all Vim errors
+            let err_msg = 'AsyncErrorPostProcess: '.checker_name.
+                        \ (a:aggregate_errors ? ' in aggregate mode' : '').
+                        \ ' throw an error: '.v:exception
+            call syntastic#log#error(err_msg)
+        finally
+            unlet b:syntastic_async_raw_errors
+        endtry
+
+        if !a:aggregate_errors
+            " AsyncUpdateErrors() only count a list which has at least
+            " one valid entry which's valid field is 1 as non-empty list.
+            " so this time, a list after post process becomes an empty list
+            " because it's entries really got cleared by post procedure.
+            if post_errors.isEmpty()
+                let following_checkers_list = s:GetFollowingCheckers(remain_ft_checkers_map)
+                if !empty(following_checkers_list)
+                    let t_warning = checker_name."'s postprocess delete all error entries, ".
+                                \ "the checkers following this one will run."
+                    echohl Error | echomsg t_warning | echohl None
+                endif
+            endif
+        endif
+
+        if !post_errors.isEmpty()
+            let newLoclist = newLoclist.extend(s:DecorateAndSort(post_errors,
+                        \ checker, names, decorate_errors, sort_aggregated_errors))
+        endif
+    endfor
+
+    if !a:aggregate_errors && !empty(following_checkers_list)
+        let b:syntastic_async_following_checkers_list = following_checkers_list
+        call s:UpdateErrors(0)
+        " keep old loclist
+        return g:SyntasticLoclist.current()
+    endif
+
+    " directly copy from CacheErrors()
+    if !empty(names)
+        if len(syntastic#util#unique(map( copy(names), 'substitute(v:val, "\\m/.*", "", "")' ))) == 1
+            let type = substitute(names[0], '\m/.*', '', '')
+            let name = join(map( names, 'substitute(v:val, "\\m.\\{-}/", "", "")' ), ', ')
+            call newLoclist.setName( name . ' ('. type . ')' )
+        else
+            " checkers from mixed types
+            call newLoclist.setName(join(names, ', '))
+        endif
+    endif
+    if sort_aggregated_errors
+        call newLoclist.sort()
+    endif
+
+    " update real error number of this round
+    call s:UpdateBufErrorsNumMap(short_fname, len(newLoclist.getRaw()))
+    return newLoclist
+endfunction
+" client code above }}}
+" -------------------------------
+
+
+
 "refresh and redraw all the error info for this buf when saving or reading
 function! s:UpdateErrors(auto_invoked, checker_names) " {{{2
     call syntastic#log#debugShowVariables(g:_SYNTASTIC_DEBUG_TRACE, 'version')
@@ -292,6 +1179,11 @@ function! s:UpdateErrors(auto_invoked, checker_names) " {{{2
     let run_checks = !a:auto_invoked || s:modemap.allowsAutoChecking(&filetype)
     if run_checks
         call s:CacheErrors(a:checker_names)
+    endif
+
+    if g:syntastic_enable_async
+        " checker result handled by RemoteReply autocmd
+        return
     endif
 
     let loclist = g:SyntasticLoclist.current()
@@ -355,18 +1247,49 @@ function! s:CacheErrors(checker_names) " {{{2
         let decorate_errors = aggregate_errors && syntastic#util#var('id_checkers')
         let sort_aggregated_errors = aggregate_errors && syntastic#util#var('sort_aggregated_errors')
 
+        " new syntastic implement hold all checkers in one list
+        if g:syntastic_enable_async
+            if !has('clientserver')
+                call syntastic#log#warn('clientserver feature missing, async disable')
+                let g:syntastic_enable_async = 0
+            endif
+        endif
+
         let clist = []
+        if g:syntastic_enable_async
+            let following_checkers_filled = 0
+            if exists("b:syntastic_async_following_checkers_list")
+                call extend(clist, b:syntastic_async_following_checkers_list)
+                unlet b:syntastic_async_following_checkers_list
+                let following_checkers_filled = 1
+            endif
+        endif
         for type in filetypes
+            if g:syntastic_enable_async && following_checkers_filled
+                break
+            endif
+
             call extend(clist, s:registry.getCheckers(type, a:checker_names))
         endfor
 
         let names = []
         let unavailable_checkers = 0
         for checker in clist
+            if g:syntastic_enable_async && following_checkers_filled
+                " run remaining checkers don't need to calculate unavailable_checkers again
+                break
+            endif
+
             let cname = checker.getFiletype() . '/' . checker.getName()
             if !checker.isAvailable()
                 call syntastic#log#debug(g:_SYNTASTIC_DEBUG_TRACE, 'CacheErrors: Checker ' . cname . ' is not available')
                 let unavailable_checkers += 1
+                continue
+            endif
+
+            if g:syntastic_enable_async
+                " new syntastic s:registry.getCheckers() will not filter no active checkers.
+                " loop to calculate unavailable_checkers to make warning below work.
                 continue
             endif
 
@@ -392,6 +1315,7 @@ function! s:CacheErrors(checker_names) " {{{2
             endif
         endfor
 
+        " in async mode, names is alwasy empty.
         " set names {{{3
         if !empty(names)
             if len(syntastic#util#unique(map( copy(names), 'substitute(v:val, "\\m/.*", "", "")' ))) == 1
@@ -419,6 +1343,26 @@ function! s:CacheErrors(checker_names) " {{{2
         endif
         " }}}3
 
+        if g:syntastic_enable_async
+            " non async version will update an empty loclist.
+            " here calling PrepareCheckers() with empty map will
+            " result in updating an empty loclist too.
+            "
+            " Update: new syntastic has to explicitly check whether a checker is active.
+            " registry.getCheckers() will not filter for you. so empty(clist) doesn't
+            " work anymore.
+            if len(clist) == unavailable_checkers
+                return
+            endif
+
+            if !empty(a:checker_names)
+                " if user specify a checker name, it acts like aggregate mode
+                " with only one checker.
+                let aggregate_errors = 1
+            endif
+            call s:PrepareCheckers(clist, aggregate_errors)
+            return
+        endif
         call syntastic#log#debug(g:_SYNTASTIC_DEBUG_LOCLIST, 'aggregated:', newLoclist)
         if sort_aggregated_errors
             call newLoclist.sort()
@@ -450,6 +1394,20 @@ endfunction " }}}2
 " @vimlint(EVL102, 1, l:env_save)
 function! SyntasticMake(options) " {{{2
     call syntastic#log#debug(g:_SYNTASTIC_DEBUG_TRACE, 'SyntasticMake: called with options:', a:options)
+
+    let errors = []
+    if g:syntastic_enable_async && !exists("b:syntastic_async_raw_errors")
+        let b:syntastic_make_options = a:options
+        " async return empty error list here
+        " currently don't suppor plugin checkers' self afterward process
+        " make a fake error list, otherwise quiet messages will complain
+        " missing key.
+        return [{"async": "async", "text": "", "type": "", "bufnr": 0, 'lnum': 0, 'col': 0, 'valid': 1, 'vcol': 0, 'nr': -1, 'pattern': ''}]
+    endif
+
+    if exists("b:syntastic_async_raw_errors")
+        return s:PostMake(b:syntastic_async_raw_errors, a:options)
+    endif
 
     " save options and locale env variables {{{3
     let old_shellredir = &shellredir
@@ -546,6 +1504,14 @@ function! SyntasticMake(options) " {{{2
     if bailout
         throw 'Syntastic: checker error'
     endif
+
+    return s:PostMake(errors, a:options)
+endfunction
+
+" split SyntasticMake so merge from master don't cause much diff code because
+" of if-else code block spaces format.
+function! s:PostMake(errors, options)
+    let errors = a:errors
 
     call syntastic#log#debug(g:_SYNTASTIC_DEBUG_LOCLIST, 'raw loclist:', errors)
 
