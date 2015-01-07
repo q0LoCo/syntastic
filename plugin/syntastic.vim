@@ -831,11 +831,13 @@ function! s:RefreshErrors(loclist)
     let loclist = g:SyntasticLoclist.current()
 
     " populate loclist and jump {{{3
-    let do_jump = syntastic#util#var('auto_jump')
+    let do_jump = syntastic#util#var('auto_jump') + 0
     if do_jump == 2
-        let first = loclist.getFirstIssue()
-        let type = get(first, 'type', '')
-        let do_jump = type ==? 'E'
+        let do_jump = loclist.getFirstError(1)
+    elseif do_jump == 3
+        let do_jump = loclist.getFirstError()
+    elseif 0 > do_jump || do_jump > 3
+        let do_jump = 0
     endif
 
     let w:syntastic_loclist_set = 0
@@ -845,7 +847,7 @@ function! s:RefreshErrors(loclist)
         let w:syntastic_loclist_set = 1
         if do_jump && !loclist.isEmpty()
             call syntastic#log#debug(g:_SYNTASTIC_DEBUG_NOTIFICATIONS, 'loclist: jump')
-            silent! lrewind
+            execute 'silent! lrewind ' . do_jump
 
             " XXX: Vim doesn't call autocmd commands in a predictible
             " order, which can lead to missing filetype when jumping
