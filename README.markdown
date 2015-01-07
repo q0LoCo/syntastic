@@ -1,6 +1,6 @@
 a async version of syntastic use vim's clientserver feature
 
-update to latest master commit 67ffe58818
+update to latest master commit oda7a1e
 
 echo has('clientserver') should return 1
 
