@@ -394,7 +394,7 @@ function! s:StartupServerOnly()
                     let cmd .= ' "'.escape(server_cmd, '"').'"'
                 else
                     " gnome-terminal can set WM_WINDOW_ROLE, so xwit can minimize.
-                    let cmd = "gnome-terminal --class \"VIMSERVER\" --disable-factory"
+                    let cmd = "gnome-terminal --class \"VIMSERVER\" "
                                 \ .' --role "syntastic_server"'
                                 \ .' -e "'.escape(server_cmd, '"').'" &'
                 endif
